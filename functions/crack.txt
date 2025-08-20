@@ -1,0 +1,30 @@
+egor@eltex-study:~/eltex_systems/functions$ (echo -ne "AAAAAAAAAAAAAAAAAAAA"; echo -ne "\xd8\x11\x40\x00\x00\x00\x00\x00") > input.txt
+egor@eltex-study:~/eltex_systems/functions$ ./crack < input.txt
+Enter password:
+Access granted!
+Bus error (core dumped)
+egor@eltex-study:~/eltex_systems/functions$
+
+Dump of assembler code for function main:
+   0x0000000000401196 <+0>:     endbr64
+   0x000000000040119a <+4>:     push   %rbp
+   0x000000000040119b <+5>:     mov    %rsp,%rbp
+   0x000000000040119e <+8>:     sub    $0x10,%rsp
+   0x00000000004011a2 <+12>:    lea    0xe5b(%rip),%rax        # 0x402004
+   0x00000000004011a9 <+19>:    mov    %rax,%rdi
+   0x00000000004011ac <+22>:    call   0x401070 <puts@plt>
+   0x00000000004011b1 <+27>:    call   0x4011ee <IsPassOk>
+   0x00000000004011b6 <+32>:    mov    %eax,-0x4(%rbp)
+   0x00000000004011b9 <+35>:    cmpl   $0x0,-0x4(%rbp)
+   0x00000000004011bd <+39>:    jne    0x4011d8 <main+66>
+   0x00000000004011bf <+41>:    lea    0xe4e(%rip),%rax        # 0x402014
+   0x00000000004011c6 <+48>:    mov    %rax,%rdi
+   0x00000000004011c9 <+51>:    call   0x401070 <puts@plt>
+   0x00000000004011ce <+56>:    mov    $0x1,%edi
+   0x00000000004011d3 <+61>:    call   0x4010a0 <exit@plt>
+   0x00000000004011d8 <+66>:    lea    0xe43(%rip),%rax        # 0x402022
+   0x00000000004011df <+73>:    mov    %rax,%rdi
+   0x00000000004011e2 <+76>:    call   0x401070 <puts@plt>
+   0x00000000004011e7 <+81>:    mov    $0x0,%eax
+   0x00000000004011ec <+86>:    leave
+   0x00000000004011ed <+87>:    ret
