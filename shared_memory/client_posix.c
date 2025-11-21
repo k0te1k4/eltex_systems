@@ -1,0 +1,53 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+typedef struct {
+    int flag;
+    char text[64];
+} shm_data_t;
+
+#define SHM_NAME "/my_posix_shm"
+
+int main(void)
+{
+    int fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (fd == -1) {
+        perror("shm_open");
+        return 1;
+    }
+
+    shm_data_t *data = (shm_data_t *)mmap(NULL, sizeof(shm_data_t),
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    close(fd);
+
+    printf("POSIX client: waiting for server message...\n");
+    while (data->flag != 1) {
+        usleep(100000);
+    }
+
+    printf("POSIX client: got: %s\n", data->text);
+
+    strncpy(data->text, "Hello!", sizeof(data->text));
+    data->text[sizeof(data->text) - 1] = '\0';
+    data->flag = 2;
+
+    printf("POSIX client: sent reply: %s\n", data->text);
+
+    if (munmap(data, sizeof(shm_data_t)) == -1) {
+        perror("munmap");
+    }
+
+    return 0;
+}
