@@ -4,16 +4,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
-#include <ctype.h>
+#include <sys/timerfd.h>
+#include <poll.h>
+
+#define MSGSZ 256
 
 typedef struct {
     pid_t pid;
-    int fd;     // parent side
+    int fd;
     int alive;
 } driver_t;
 
@@ -26,143 +31,116 @@ static void die(const char *m) {
     exit(1);
 }
 
-static int write_all(int fd, const void *buf, size_t n) {
-    const char *p = (const char*)buf;
-    while (n) {
-        ssize_t r = write(fd, p, n);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        p += (size_t)r;
-        n -= (size_t)r;
-    }
+static int set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
     return 0;
 }
 
-static int read_line(int fd, char *buf, size_t cap) {
-    if (cap == 0) return -1;
-    size_t i = 0;
-    while (i + 1 < cap) {
-        char c;
-        ssize_t r = read(fd, &c, 1);
-        if (r == 0) break;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        buf[i++] = c;
-        if (c == '\n') break;
-    }
-    buf[i] = 0;
-    return (int)i;
+/* ---------- driver process ---------- */
+
+static int timer_set_secs(int tfd, int seconds) {
+    struct itimerspec it;
+    memset(&it, 0, sizeof(it));
+    if (seconds > 0) it.it_value.tv_sec = seconds;
+    return timerfd_settime(tfd, 0, &it, NULL);
 }
 
-static double now_monotonic(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+static int timer_remaining_secs(int tfd) {
+    struct itimerspec it;
+    if (timerfd_gettime(tfd, &it) != 0) return 0;
+    if (it.it_value.tv_nsec != 0) return (int)it.it_value.tv_sec + 1;
+    return (int)it.it_value.tv_sec;
 }
 
-static int ceil_positive(double x) {
-    if (x <= 0.0) return 0;
-    int i = (int)x;
-    if ((double)i == x) return i;
-    return i + 1;
-}
+static void driver_loop(int sock_fd) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) _exit(1);
 
-/* ---------------- driver process ---------------- */
+    int busy = 0;
 
-static void driver_loop(int fd) {
-    double busy_until = 0.0;
+    struct pollfd pfds[2];
+    pfds[0].fd = sock_fd;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = tfd;
+    pfds[1].events = POLLIN;
 
     for (;;) {
-        char line[256];
-        int n = read_line(fd, line, sizeof(line));
-        if (n <= 0) _exit(0);
+        int r = poll(pfds, 2, -1);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            _exit(1);
+        }
 
-        // trim
-        char *s = line;
-        while (*s && isspace((unsigned char)*s)) s++;
-        char *e = s + strlen(s);
-        while (e > s && isspace((unsigned char)e[-1])) e--;
-        *e = 0;
+        if (pfds[1].revents & POLLIN) {
+            uint64_t exp = 0;
+            ssize_t rr = read(tfd, &exp, sizeof(exp));
+            if (rr < 0 && errno != EAGAIN) _exit(1);
+            busy = 0;
+            (void)timer_set_secs(tfd, 0);
+        }
 
-        double now = now_monotonic();
-        int busy = (now < busy_until);
-        int rem = ceil_positive(busy_until - now);
+        if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            _exit(0);
+        }
 
-        if (strncmp(s, "TASK", 4) == 0 && (s[4] == 0 || isspace((unsigned char)s[4]))) {
-            char *p = s + 4;
-            while (*p && isspace((unsigned char)*p)) p++;
-            long t = strtol(p, NULL, 10);
-            if (t <= 0) {
-                const char *resp = "Error BadTimer\n";
-                write_all(fd, resp, strlen(resp));
+        if (pfds[0].revents & POLLIN) {
+            char msg[MSGSZ];
+            ssize_t n = recv(sock_fd, msg, sizeof(msg) - 1, 0);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                _exit(1);
+            }
+            if (n == 0) _exit(0);
+            msg[n] = 0;
+
+            if (strncmp(msg, "QUIT", 4) == 0) {
+                (void)send(sock_fd, "Bye", 3, 0);
+                _exit(0);
+            }
+
+            if (strncmp(msg, "STATUS", 6) == 0) {
+                if (busy) {
+                    int rem = timer_remaining_secs(tfd);
+                    char resp[64];
+                    snprintf(resp, sizeof(resp), "Busy %d", rem);
+                    (void)send(sock_fd, resp, strlen(resp), 0);
+                } else {
+                    (void)send(sock_fd, "Available", 9, 0);
+                }
                 continue;
             }
 
-            now = now_monotonic();
-            busy = (now < busy_until);
-            rem = ceil_positive(busy_until - now);
+            if (strncmp(msg, "TASK", 4) == 0) {
+                char *p = msg + 4;
+                while (*p && isspace((unsigned char)*p)) p++;
+                char *end = NULL;
+                long sec = strtol(p, &end, 10);
+                if (end == p || sec <= 0 || sec > 86400) {
+                    (void)send(sock_fd, "Error BadTimer", 14, 0);
+                    continue;
+                }
 
-            if (busy) {
-                char resp[64];
-                snprintf(resp, sizeof(resp), "Busy %d\n", rem);
-                write_all(fd, resp, strlen(resp));
-            } else {
-                busy_until = now + (double)t;
-                const char *resp = "OK\n";
-                write_all(fd, resp, strlen(resp));
+                if (busy) {
+                    int rem = timer_remaining_secs(tfd);
+                    char resp[64];
+                    snprintf(resp, sizeof(resp), "Busy %d", rem);
+                    (void)send(sock_fd, resp, strlen(resp), 0);
+                } else {
+                    busy = 1;
+                    if (timer_set_secs(tfd, (int)sec) != 0) _exit(1);
+                    (void)send(sock_fd, "OK", 2, 0);
+                }
+                continue;
             }
-        } else if (strcmp(s, "STATUS") == 0) {
-            now = now_monotonic();
-            busy = (now < busy_until);
-            rem = ceil_positive(busy_until - now);
 
-            if (busy) {
-                char resp[64];
-                snprintf(resp, sizeof(resp), "Busy %d\n", rem);
-                write_all(fd, resp, strlen(resp));
-            } else {
-                const char *resp = "Available\n";
-                write_all(fd, resp, strlen(resp));
-            }
-        } else if (strcmp(s, "QUIT") == 0) {
-            const char *resp = "Bye\n";
-            write_all(fd, resp, strlen(resp));
-            _exit(0);
-        } else {
-            const char *resp = "Error UnknownCommand\n";
-            write_all(fd, resp, strlen(resp));
+            (void)send(sock_fd, "Error UnknownCommand", 20, 0);
         }
     }
 }
 
-/* ---------------- parent / CLI ---------------- */
-
-static void reap_children(void) {
-    for (;;) {
-        int status;
-        pid_t p = waitpid(-1, &status, WNOHANG);
-        if (p <= 0) break;
-        for (size_t i = 0; i < drivers_n; i++) {
-            if (drivers[i].alive && drivers[i].pid == p) {
-                drivers[i].alive = 0;
-                if (drivers[i].fd >= 0) close(drivers[i].fd);
-                drivers[i].fd = -1;
-                break;
-            }
-        }
-    }
-}
-
-static driver_t* find_driver(pid_t pid) {
-    for (size_t i = 0; i < drivers_n; i++) {
-        if (drivers[i].pid == pid) return &drivers[i];
-    }
-    return NULL;
-}
+/* ---------- CLI ---------- */
 
 static void drivers_push(pid_t pid, int fd) {
     if (drivers_n == drivers_cap) {
@@ -175,19 +153,35 @@ static void drivers_push(pid_t pid, int fd) {
     drivers[drivers_n++] = (driver_t){ .pid = pid, .fd = fd, .alive = 1 };
 }
 
-static int send_cmd_read_resp(driver_t *d, const char *cmd, char *resp, size_t resp_cap) {
-    if (!d || !d->alive || d->fd < 0) return -1;
+static driver_t* find_driver(pid_t pid) {
+    for (size_t i = 0; i < drivers_n; i++) {
+        if (drivers[i].pid == pid) return &drivers[i];
+    }
+    return NULL;
+}
 
-    if (write_all(d->fd, cmd, strlen(cmd)) != 0) return -1;
-
-    int n = read_line(d->fd, resp, resp_cap);
-    if (n <= 0) return -1;
-    return 0;
+static void reap_children(void) {
+    for (;;) {
+        int st = 0;
+        pid_t p = waitpid(-1, &st, WNOHANG);
+        if (p <= 0) break;
+        for (size_t i = 0; i < drivers_n; i++) {
+            if (drivers[i].alive && drivers[i].pid == p) {
+                drivers[i].alive = 0;
+                if (drivers[i].fd >= 0) close(drivers[i].fd);
+                drivers[i].fd = -1;
+                break;
+            }
+        }
+    }
 }
 
 static void cmd_create_driver(void) {
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) die("socketpair");
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) die("socketpair");
+
+    if (set_nonblock(sv[0]) != 0) die("nonblock");
+    if (set_nonblock(sv[1]) != 0) die("nonblock");
 
     pid_t pid = fork();
     if (pid < 0) die("fork");
@@ -204,24 +198,33 @@ static void cmd_create_driver(void) {
     fflush(stdout);
 }
 
-static void cmd_send_task(pid_t pid, int t) {
+static void send_cmd(driver_t *d, const char *cmd) {
+    if (!d || !d->alive) {
+        printf("Error NoSuchDriver\n");
+        return;
+    }
+    ssize_t r = send(d->fd, cmd, strlen(cmd), 0);
+    if (r < 0) {
+        if (errno == EPIPE || errno == ECONNRESET) {
+            printf("Error DriverDead\n");
+            d->alive = 0;
+            close(d->fd);
+            d->fd = -1;
+        } else {
+            printf("Error SendFailed\n");
+        }
+    }
+}
+
+static void cmd_send_task(pid_t pid, int sec) {
     driver_t *d = find_driver(pid);
     if (!d || !d->alive) {
         printf("Error NoSuchDriver\n");
         return;
     }
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "TASK %d\n", t);
-
-    char resp[128];
-    if (send_cmd_read_resp(d, cmd, resp, sizeof(resp)) != 0) {
-        printf("Error DriverDead\n");
-        d->alive = 0;
-        if (d->fd >= 0) close(d->fd);
-        d->fd = -1;
-        return;
-    }
-    fputs(resp, stdout);
+    char msg[MSGSZ];
+    snprintf(msg, sizeof(msg), "TASK %d", sec);
+    send_cmd(d, msg);
 }
 
 static void cmd_get_status(pid_t pid) {
@@ -230,52 +233,13 @@ static void cmd_get_status(pid_t pid) {
         printf("Error NoSuchDriver\n");
         return;
     }
-    char resp[128];
-    if (send_cmd_read_resp(d, "STATUS\n", resp, sizeof(resp)) != 0) {
-        printf("Error DriverDead\n");
-        d->alive = 0;
-        if (d->fd >= 0) close(d->fd);
-        d->fd = -1;
-        return;
-    }
-    fputs(resp, stdout);
+    send_cmd(d, "STATUS");
 }
 
 static void cmd_get_drivers(void) {
     for (size_t i = 0; i < drivers_n; i++) {
-        driver_t *d = &drivers[i];
-        if (!d->alive) continue;
-
-        char resp[128];
-        if (send_cmd_read_resp(d, "STATUS\n", resp, sizeof(resp)) != 0) {
-            d->alive = 0;
-            if (d->fd >= 0) close(d->fd);
-            d->fd = -1;
-            continue;
-        }
-
-        // resp already has \n
-        printf("%d: %s", d->pid, resp);
-    }
-}
-
-static void shutdown_all(void) {
-    for (size_t i = 0; i < drivers_n; i++) {
-        if (!drivers[i].alive || drivers[i].fd < 0) continue;
-        char resp[64];
-        send_cmd_read_resp(&drivers[i], "QUIT\n", resp, sizeof(resp));
-        close(drivers[i].fd);
-        drivers[i].fd = -1;
-        drivers[i].alive = 0;
-    }
-
-    for (;;) {
-        int status;
-        pid_t p = waitpid(-1, &status, 0);
-        if (p < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+        if (!drivers[i].alive) continue;
+        send_cmd(&drivers[i], "STATUS");
     }
 }
 
@@ -283,65 +247,152 @@ static char* next_tok(char **ps) {
     char *s = *ps;
     while (*s && isspace((unsigned char)*s)) s++;
     if (!*s) { *ps = s; return NULL; }
-    char *start = s;
+    char *st = s;
     while (*s && !isspace((unsigned char)*s)) s++;
     if (*s) *s++ = 0;
     *ps = s;
-    return start;
+    return st;
+}
+
+static void handle_driver_readable(driver_t *d) {
+    for (;;) {
+        char resp[MSGSZ];
+        ssize_t n = recv(d->fd, resp, sizeof(resp) - 1, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            d->alive = 0;
+            close(d->fd);
+            d->fd = -1;
+            return;
+        }
+        if (n == 0) {
+            d->alive = 0;
+            close(d->fd);
+            d->fd = -1;
+            return;
+        }
+        resp[n] = 0;
+        printf("%d: %s\n", d->pid, resp);
+        fflush(stdout);
+    }
+}
+
+static void shutdown_all(void) {
+    for (size_t i = 0; i < drivers_n; i++) {
+        if (!drivers[i].alive) continue;
+        (void)send(drivers[i].fd, "QUIT", 4, 0);
+    }
+    for (size_t i = 0; i < drivers_n; i++) {
+        if (drivers[i].fd >= 0) close(drivers[i].fd);
+        drivers[i].fd = -1;
+        drivers[i].alive = 0;
+    }
+    for (;;) {
+        int st = 0;
+        pid_t p = waitpid(-1, &st, 0);
+        if (p < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+    }
 }
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
-    char line[256];
+    char line[MSGSZ];
 
     for (;;) {
         reap_children();
 
+        size_t nfds = 1;
+        for (size_t i = 0; i < drivers_n; i++) if (drivers[i].alive) nfds++;
+
+        struct pollfd *pfds = (struct pollfd*)calloc(nfds, sizeof(*pfds));
+        if (!pfds) die("calloc");
+
+        pfds[0].fd = STDIN_FILENO;
+        pfds[0].events = POLLIN;
+
+        size_t idx = 1;
+        for (size_t i = 0; i < drivers_n; i++) {
+            if (!drivers[i].alive) continue;
+            pfds[idx].fd = drivers[i].fd;
+            pfds[idx].events = POLLIN | POLLHUP | POLLERR;
+            idx++;
+        }
+
         printf("> ");
         fflush(stdout);
 
-        if (!fgets(line, sizeof(line), stdin)) break;
-
-        char *p = line;
-        char *cmd = next_tok(&p);
-        if (!cmd) continue;
-
-        if (strcmp(cmd, "create_driver") == 0) {
-            cmd_create_driver();
-        } else if (strcmp(cmd, "send_task") == 0) {
-            char *spid = next_tok(&p);
-            char *st = next_tok(&p);
-            if (!spid || !st) {
-                printf("Error Usage: send_task <pid> <task_timer>\n");
-                continue;
-            }
-            pid_t pid = (pid_t)strtol(spid, NULL, 10);
-            int t = (int)strtol(st, NULL, 10);
-            if (pid <= 0 || t <= 0) {
-                printf("Error BadArgs\n");
-                continue;
-            }
-            cmd_send_task(pid, t);
-        } else if (strcmp(cmd, "get_status") == 0) {
-            char *spid = next_tok(&p);
-            if (!spid) {
-                printf("Error Usage: get_status <pid>\n");
-                continue;
-            }
-            pid_t pid = (pid_t)strtol(spid, NULL, 10);
-            if (pid <= 0) {
-                printf("Error BadArgs\n");
-                continue;
-            }
-            cmd_get_status(pid);
-        } else if (strcmp(cmd, "get_drivers") == 0) {
-            cmd_get_drivers();
-        } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
-            break;
-        } else {
-            printf("Error UnknownCommand\n");
+        int r = poll(pfds, (nfds_t)nfds, -1);
+        if (r < 0) {
+            free(pfds);
+            if (errno == EINTR) continue;
+            die("poll");
         }
+
+        if (pfds[0].revents & POLLIN) {
+            if (!fgets(line, sizeof(line), stdin)) {
+                free(pfds);
+                break;
+            }
+
+            char *p = line;
+            char *cmd = next_tok(&p);
+            if (cmd) {
+                if (strcmp(cmd, "create_driver") == 0) {
+                    cmd_create_driver();
+                } else if (strcmp(cmd, "send_task") == 0) {
+                    char *spid = next_tok(&p);
+                    char *st = next_tok(&p);
+                    if (!spid || !st) {
+                        printf("Error Usage: send_task <pid> <task_timer>\n");
+                    } else {
+                        pid_t pid = (pid_t)strtol(spid, NULL, 10);
+                        int t = (int)strtol(st, NULL, 10);
+                        if (pid <= 0 || t <= 0) printf("Error BadArgs\n");
+                        else cmd_send_task(pid, t);
+                    }
+                } else if (strcmp(cmd, "get_status") == 0) {
+                    char *spid = next_tok(&p);
+                    if (!spid) {
+                        printf("Error Usage: get_status <pid>\n");
+                    } else {
+                        pid_t pid = (pid_t)strtol(spid, NULL, 10);
+                        if (pid <= 0) printf("Error BadArgs\n");
+                        else cmd_get_status(pid);
+                    }
+                } else if (strcmp(cmd, "get_drivers") == 0) {
+                    cmd_get_drivers();
+                } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+                    free(pfds);
+                    break;
+                } else {
+                    printf("Error UnknownCommand\n");
+                }
+                fflush(stdout);
+            }
+        }
+
+        idx = 1;
+        for (size_t i = 0; i < drivers_n; i++) {
+            if (!drivers[i].alive) continue;
+
+            if (pfds[idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                drivers[i].alive = 0;
+                close(drivers[i].fd);
+                drivers[i].fd = -1;
+                idx++;
+                continue;
+            }
+            if (pfds[idx].revents & POLLIN) {
+                handle_driver_readable(&drivers[i]);
+            }
+            idx++;
+        }
+
+        free(pfds);
     }
 
     shutdown_all();
