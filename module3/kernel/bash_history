@@ -1,0 +1,10 @@
+# Вырезка из bash_history:
+
+git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+cd linux
+export ARCH=arm
+export CROSS_COMPILE=arm-linux-gnueabihf-
+make multi_v7_defconfig
+make menuconfig
+make -j"$(nproc)" zImage dtbs
+file arch/arm/boot/zImage

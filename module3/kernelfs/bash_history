@@ -1,0 +1,13 @@
+# Вырезка из bash_history:
+
+nano init.c
+sudo apt install gcc-arm-linux-gnueabihf
+arm-linux-gnueabihf-gcc -static -O2 -s init.c -o init
+file init
+mkdir -p rootfs
+cp init rootfs/init
+chmod +x rootfs/init
+cd rootfs
+find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../initramfs_min.cpio.gz
+cd ..
+qemu-system-arm   -M virt -cpu cortex-a15 -m 512M   -kernel arch/arm/boot/zImage   -initrd initramfs_min.cpio.gz   -append "console=ttyAMA0 rdinit=/init"   -nographic

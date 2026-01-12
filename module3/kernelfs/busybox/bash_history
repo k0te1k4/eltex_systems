@@ -1,0 +1,34 @@
+# Вырезка из bash_history:
+
+make distclean
+# Была проблема с тем, что почему-то несмотря на указание архитектуры, он все равно тянул sha1_hwaccel
+sed -i 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' .config
+sed -i 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config
+
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- menuconfig
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- install
+ROOTFS="$PWD/_install"
+mkdir -p "$ROOTFS"/{dev,proc,sys,etc,init.d,tmp,var,run,mnt,root,home}
+chmod 1777 "$ROOTFS/tmp"
+cat > "$ROOTFS/init" <<'EOF'
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || mount -t tmpfs none /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+
+echo "Boot OK: initramfs"
+exec /bin/sh
+EOF
+
+chmod +x "$ROOTFS/init"
+sudo mknod -m 600 "$ROOTFS/dev/console" c 5 1
+sudo mknod -m 666 "$ROOTFS/dev/null" c 1 3
+cd "$ROOTFS"
+sudo chown -R root:root .
+find . -print0 | sudo cpio --null -ov --format=newc | gzip -9 > ../initramfs.cpio.gz
+ls -lh ../initramfs.cpio.gz
+cd ..
+qemu-system-arm   -M virt -cpu cortex-a15 -m 512M   -kernel ~/eltex_systems/kernel/linux/arch/arm/boot/zImage   -initrd initramfs.cpio.gz   -append "console=ttyAMA0 rdinit=/init"   -nographic
