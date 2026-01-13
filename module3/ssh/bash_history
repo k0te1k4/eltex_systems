@@ -1,0 +1,86 @@
+# вырезка из bash_history
+
+export TOP=~/eltex_systems
+export SRC=$TOP
+export ROOTFS=$TOP/module3/kernelfs/busybox/busybox-1.37.0/_install
+export CROSS=arm-linux-gnueabihf
+export SYSROOT=$($CROSS-gcc -print-sysroot)
+export PATH="/usr/bin:$PATH"
+export CC=$CROSS-gcc
+export AR=$CROSS-ar
+export RANLIB=$CROSS-ranlib
+export STRIP=$CROSS-strip
+export BUILD=$(gcc -dumpmachine)
+export HOST=arm-linux-gnueabihf
+export DEST=$TOP/_staging_arm
+
+mkdir -p "$DEST" "$ROOTFS"
+cd "$SRC"
+tar xf openssh-9.6p1.tar.gz
+tar xf openssl-1.1.1w.tar.gz
+tar xf zlib-1.3.1.tar.gz
+
+cd "$SRC/zlib-1.3.1"
+make distclean 2>/dev/null || true
+
+CHOST=$HOST CC=$CC AR=$AR RANLIB=$RANLIB \
+./configure --prefix=/usr
+
+make -j"$(nproc)"
+make DESTDIR="$DEST" install
+
+cd "$SRC/openssl-1.1.1w"
+make clean 2>/dev/null || true
+
+./Configure linux-armv4 \
+  --prefix=/usr --openssldir=/etc/ssl \
+  no-shared no-tests \
+  --cross-compile-prefix=${CROSS}-
+
+make -j"$(nproc)"
+make DESTDIR="$DEST" install_sw
+
+cd "$SRC/openssh-9.6p1"
+make distclean 2>/dev/null || true
+
+export CPPFLAGS="-I$DEST/usr/include"
+export LDFLAGS="-L$DEST/usr/lib"
+export LIBS="-lz -lcrypto"
+
+./configure \
+  --build="$BUILD" --host="$HOST" \
+  --prefix=/usr --sysconfdir=/etc/ssh \
+  --with-privsep-path=/var/empty \
+  --with-ssl-dir="$DEST/usr" \
+  --with-zlib="$DEST/usr" \
+  --without-pam --disable-strip
+
+make -j"$(nproc)"
+make DESTDIR="$DEST" install
+
+mkdir -p "$ROOTFS/usr" "$ROOTFS/etc" "$ROOTFS/var/empty" "$ROOTFS/var/run" "$ROOTFS/etc/ssh" "$ROOTFS/usr/libexec"
+
+cp -a "$DEST/usr/." "$ROOTFS/usr/"
+cp -a "$DEST/etc/ssh" "$ROOTFS/etc/" 2>/dev/null || true
+cp -a "$DEST/usr/libexec/sftp-server" "$ROOTFS/usr/libexec/"
+
+file "$ROOTFS/usr/sbin/sshd"
+
+nano "$ROOTFS/etc/ssh/sshd_config"
+nano "$ROOTFS/init"
+chmod 755 "$ROOTFS/init"
+
+cd "$ROOTFS"
+
+fakeroot -- sh -c '
+  chown -R 0:0 .
+  find . -print0 | cpio --null -ov --format=newc | gzip -9
+' > ../initramfs.cpio.gz
+cd "$TOP/module3/kernelfs/busybox/busybox-1.37.0"
+zcat initramfs.cpio.gz | cpio -itv | grep -E ' init$'
+
+qemu-system-arm -M virt -cpu cortex-a15 -m 512M   -kernel ~/eltex_systems/kernel/linux/arch/arm/boot/zImage   -initrd ~/eltex_systems/module3/kernelfs/busybox/busybox-1.37.0/initramfs.cpio.gz   -append "console=ttyAMA0 rdinit=/init"   -nographic   -netdev user,id=n1,hostfwd=tcp:127.0.0.1:2812-:22   -device virtio-net-device,netdev=n1
+
+
+
+
