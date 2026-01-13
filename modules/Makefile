@@ -1,11 +1,10 @@
-obj-m += proc_var.o
+obj-m += proc_sys_var.o
 
 KDIR ?= /home/egor/eltex_systems/kernel/linux
-ARCH ?= arm
-CROSS_COMPILE ?= arm-linux-gnueabihf-
+PWD  := $(shell pwd)
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
+	make -C $(KDIR) M=$(PWD) ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	make -C $(KDIR) M=$(PWD) clean
